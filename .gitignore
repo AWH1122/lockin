@@ -1,0 +1,24 @@
+.DS_Store
+
+# Ignore Python cache files
+__pycache__/
+
+# Ignore all files in the data directory
+processed/
+raw/
+
+# Ignore all CSV files
+*.csv
+
+# Ignore Jupyter notebook checkpoints
+notebooks/.ipynb_checkpoints/
+
+# Ignore .env config files
+.env*
+
+# Ignore checkpoints
+checkpoints/
+
+.vscode/
+
+*logs/
