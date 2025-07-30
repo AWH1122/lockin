@@ -48,12 +48,15 @@ class TiDELite(BaseLightning):
         num_decoder_layers: int = 2,
         decoder_width: int = 64,
         temporal_hidden: int = 128,
+        past_categorical_embedding_sizes: dict[str, int | tuple[int, int]] | None = None,
+        future_categorical_embedding_sizes: dict[str, int | tuple[int, int]] | None = None,
+        static_categorical_embedding_sizes: dict[str, int | tuple[int, int]] | None = None,
         dropout: float = 0.1,
         layer_norm: bool = True,
+        use_static_covariates: bool = True,
         **kwargs,
     ):
         super().__init__(input_length, horizons, **kwargs)
-        self.save_hyperparameters(ignore=['optimizer_cls', 'scheduler_cls'])
 
         # placeholders – real modules are built in setup()
         self.encoders: nn.Module = nn.Identity()
@@ -69,8 +72,8 @@ class TiDELite(BaseLightning):
         # grab one batch to infer dims
         sample = self.train_dataset[0]
 
-        L = self.input_length
-        H = self.H
+        L = self.hparams.input_length
+        H = len(self.hparams.h)
         Dy = 1  # target dim (univariate)
         if sample['past_covariates'] is not None:
             Dp = sample['past_covariates'].shape[-1]  # past covs  (might be 0)
@@ -80,9 +83,13 @@ class TiDELite(BaseLightning):
             Df = sample['future_covariates'].shape[-1]  # futr covs  (might be 0)
         else:
             Df = 0
+        if sample['static_covariates'] is not None:
+            Ds = sample['static_covariates'].shape[-1]
+        else:
+            Ds = 0
 
         # lengths
-        enc_inp_dim = L * Dy + L * Dp + (L + H) * Df  # flattened input to encoder
+        enc_inp_dim = L * Dy + L * Dp + (L + H) * Df + (Ds * L) * self.hparams.use_static_covariates  # flattened input to encoder
         dec_out_dim = self.hparams.decoder_width  # TiDE's D'
         hidden = self.hparams.hidden_size
 
@@ -128,23 +135,25 @@ class TiDELite(BaseLightning):
         Xp = batch['past_covariates']  # [B,L,Dp] (maybe empty)
         Xfhist = batch['historic_future_covariates']  # [B,L,Df] (maybe empty)
         Xf = batch['future_covariates'] # [B,H,Df] (maybe empty)
+        Xs = batch['static_covariates']
 
         parts = [y_hist]
         if Xp is not None:
             parts.append(Xp)
         if Xfhist is not None:
             parts.append(Xfhist)
+        if self.hparams.use_static_covariates and Xs is not None:
+            parts.append(Xs)
         enc_input = torch.cat(parts, dim=2)  # [B,L, Dy+Dp+Df]
         flat_hist = enc_input.flatten(start_dim=1)  # [B, L*(...)]
+        parts = [flat_hist]
         if Xf is not None:
             flat_futr = Xf.flatten(start_dim=1)  # [B, H*Df]
-            enc = torch.cat([flat_hist, flat_futr], dim=1)  # [B, enc_inp_dim]
-        else:
-            enc = flat_hist
-
+            parts.append(flat_futr)
+        enc = torch.cat(parts, dim=1)  # [B, enc_inp_dim]
         z = self.encoders(enc)  # [B, hidden]
         dec = self.decoders(z)  # [B, H*D'*1]
-        dec = dec.view(z.size(0), self.H, -1)  # [B,H,D']
+        dec = dec.view(z.size(0), len(self.hparams.h), -1)  # [B,H,D']
         last_futr = Xf  # [B,H,Df]
         if last_futr is not None and last_futr.size(-1):
             temp_in = torch.cat([dec, last_futr], dim=2)  # [B,H,D'+Df]

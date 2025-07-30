@@ -7,6 +7,7 @@ import torch
 from lightning import Trainer
 from torch.utils.data import DataLoader
 from torchmetrics import MeanAbsolutePercentageError, MeanSquaredError
+import torch.nn as nn
 from torchmetrics.wrappers import MultioutputWrapper
 
 from fxguard.data.timeseries import TimeSeries, TimeSeriesDataset
@@ -43,25 +44,23 @@ class BaseLightning(L.LightningModule, ABC):
         lr_scheduler_cls: torch.optim.lr_scheduler.LRScheduler | None = None,
         lr_scheduler_kwargs: dict | None = None,
         trainer_kwargs: dict | None = None,
+        loss_fn=nn.MSELoss,
         *args,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.input_length = input_length
-        self.h = h if isinstance(h, list) else [h]
-        self.H = max(self.h)
+        h = list(range(1, h + 1)) if isinstance(h, int) else h
         trainer_kwargs = trainer_kwargs or {}
         self.trainer = partial(Trainer, max_epochs=n_epochs, **trainer_kwargs)
-        self.criterion = MeanSquaredError()
-        self.optimizer_cls = optimizer_cls
-        self.optimizer_kwargs = optimizer_kwargs or {}
-        self.lr_scheduler_cls = lr_scheduler_cls
-        self.lr_scheduler_kwargs = lr_scheduler_kwargs or {}
+        optimizer_kwargs = optimizer_kwargs or {}
+        lr_scheduler_kwargs = lr_scheduler_kwargs or {}
+        self.criterion = loss_fn()
+        self.save_hyperparameters()
 
     def configure_optimizers(self):
-        optimizer = self.optimizer_cls(self.parameters(), **self.optimizer_kwargs)
-        if self.lr_scheduler_cls is not None:
-            return [optimizer], [self.lr_scheduler_cls(optimizer, **self.lr_scheduler_kwargs)]
+        optimizer = self.hparams.optimizer_cls(self.parameters(), **self.hparams.optimizer_kwargs)
+        if self.hparams.lr_scheduler_cls is not None:
+            return [optimizer], [self.hparams.lr_scheduler_cls(optimizer, **self.hparams.lr_scheduler_kwargs)]
         return optimizer
 
     def training_step(self, batch: Batch):
@@ -86,15 +85,6 @@ class BaseLightning(L.LightningModule, ABC):
             return DataLoader(self.val_dataset, **self._dataloader_kwargs, collate_fn=collate_dict)
         return []
 
-    # def setup(self, stage):    #DON'T REMOVE!
-    #     if stage == 'fit':
-    #         sample = next(iter(self.train_dataloader()))
-    #         input_dim = self.input_length
-    #         output_dim = self.H
-    #         past_cov_dim = sample['past_covariates'].shape[-1]
-    #         future_cov_dim = sample['future_covariates'].shape[-1]
-    #         static_cov_dim = sample['static_covariates'].shape[-1]
-
     def fit(
         self,
         series,
@@ -118,16 +108,16 @@ class BaseLightning(L.LightningModule, ABC):
             self.trainer = self.trainer()
         self.train_dataset = TimeSeriesDataset(
             series,
-            input_length=self.input_length,
-            h=self.h,
+            input_length=self.hparams.input_length,
+            h=self.hparams.h,
             past_covariates=past_covariates,
             future_covariates=future_covariates,
         )
         if val_series is not None:
             self.val_dataset = TimeSeriesDataset(
                 val_series,
-                input_length=self.input_length,
-                h=self.h,
+                input_length=self.hparams.input_length,
+                h=self.hparams.h,
                 past_covariates=val_past_covariates,
                 future_covariates=val_future_covariates,
             )
@@ -144,16 +134,22 @@ class BaseLightning(L.LightningModule, ABC):
         batch_size: int | None = None,
         dataloader_kwargs: dict | None = None,
     ):
-        trainer: Trainer
+        dataloader_kwargs = dataloader_kwargs or {}
         if batch_size is not None:
-            trainer = self.trainer(batch_size=batch_size)
-        else:
-            trainer = self.trainer()
-        last_chunks = [ts[: -self.input_length] for ts in series]
-        predict_dataset = TimeSeriesDataset(last_chunks, past_covariates, future_covariates)
-        return trainer.predict(
+            dataloader_kwargs['batch_size'] = batch_size
+        last_chunks = [ts[: -self.hparams.input_length] for ts in series]
+        predict_dataset = TimeSeriesDataset(
+            last_chunks,
+            input_length=self.hparams.input_length,
+            h=None,
+            past_covariates=past_covariates,
+            future_covariates=future_covariates,
+        )
+        return self.trainer.predict(
             self,
-            dataloaders=self.predict_dataloader(predict_dataset, dataloader_kwargs),  # need to remove dataloader
+            dataloaders=DataLoader(
+                predict_dataset, collate_fn=collate_dict, **dataloader_kwargs
+            ),  # need to remove dataloader
         )  # the shape here will have length equal to num input series
 
     def historical_forecast(
@@ -163,7 +159,6 @@ class BaseLightning(L.LightningModule, ABC):
         future_covariates: TimeSeries | list[TimeSeries] | None = None,
         stride: int = 1,
     ):
-        # Always treat series as a list
         series_list = series if isinstance(series, list) else [series]
         past_cov_list = (
             past_covariates if isinstance(past_covariates, list) or past_covariates is None else [past_covariates]
@@ -179,8 +174,8 @@ class BaseLightning(L.LightningModule, ABC):
             fcov = future_cov_list[i] if future_cov_list and len(future_cov_list) > 1 else future_covariates
             dataset = TimeSeriesDataset(
                 ts,
-                input_length=self.input_length,
-                h=self.h,
+                input_length=self.hparams.input_length,
+                h=self.hparams.h,
                 past_covariates=pcov,
                 future_covariates=fcov,
                 stride=stride,
@@ -188,13 +183,13 @@ class BaseLightning(L.LightningModule, ABC):
             dataloader = DataLoader(dataset, batch_size=self.hparams.batch_size, shuffle=False, collate_fn=collate_dict)
             predictions = []
             for batch in dataloader:
-                predictions.extend(self(batch).cpu().flatten().tolist())
+                predictions.append(self(batch).cpu().detach().numpy())
             all_predictions.append(
                 TimeSeries(
-                    times=ts.time_index[self.hparams.input_length : len(ts.time_index) - self.H + 1],
-                    values=predictions,
+                    times=ts.time_index[self.hparams.input_length : len(ts.time_index) - max(self.hparams.h) + 1],
+                    values=np.concat(predictions, axis=0),
                     static_covariates=ts.static_covariates,
-                    components=ts.columns,
+                    components=[f'H{horizon}' for horizon in self.hparams.h],
                 )
             )
         return all_predictions if len(all_predictions) > 1 else all_predictions[0]

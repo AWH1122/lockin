@@ -10,16 +10,23 @@ from torch.utils.data import Dataset
 class TimeSeries:
     def __init__(
         self,
-        times: pd.DatetimeIndex,
+        times: pd.DatetimeIndex | pd.Timestamp,
         values: ArrayLike,
         components: pd.Index | Sequence | None = None,
         static_covariates: dict[str, Any] | None = None,
         freq: str = 'D',
     ):
         if not isinstance(values, np.ndarray):
+            print('not np')
             values = np.asarray(values)
-        if not isinstance(times, pd.DatetimeIndex):
+        # Handle single timestamp edge-case
+        if isinstance(times, pd.Timestamp):
+            print('ts proc')
+            times = pd.DatetimeIndex([pd.to_datetime(times, utc=True)])
+        elif not isinstance(times, pd.DatetimeIndex):
+            print('nodanindex!')
             times = pd.to_datetime(times, utc=True)
+
         self.values = values
         self.time_index = times
         if len(values) != len(times):
@@ -50,13 +57,16 @@ class TimeSeries:
     def __len__(self):
         return len(self.values)
 
-    def to_series(self):
+    def copy(self)->'TimeSeries':
+        return TimeSeries(self.time_index,self.values,self.columns,self.static_covariates,self.freq)
+
+    def to_series(self) -> pd.Series:
         # Only works for single-component series
         if len(self._components) != 1:
             raise ValueError('to_series only works for single-component series')
         return pd.Series(self.values.flatten(), index=self.time_index, name=self._components[0])
 
-    def to_dataframe(self):
+    def to_dataframe(self) -> pd.DataFrame:
         return pd.DataFrame(self.values, index=self.time_index, columns=self._components)
 
     @property
@@ -127,11 +137,13 @@ class TimeSeriesDataset(Dataset):
         past_covariates: TimeSeries | list[TimeSeries] = None,
         future_covariates: TimeSeries | list[TimeSeries] = None,
         stride: int = 1,
+        embeddings_dict: dict[str, dict] | None = None,
     ):
         self.series_list = ts if isinstance(ts, list) else [ts]
         self.L = input_length
-        h = h or 0
-        self.horizons = list(range(1, h + 1)) if isinstance(h, int) else h
+        h = h or [0]
+        self.horizons = np.array(range(1, h + 1)) if isinstance(h, int) else np.array(h)
+        self.is_contiguous = set(np.diff(self.horizons)) == {1}
         self.H = max(self.horizons)
 
         self.past_covariates = past_covariates
@@ -161,20 +173,30 @@ class TimeSeriesDataset(Dataset):
     def __len__(self):
         return len(self.index)
 
-    def __getitem__(self, idx) -> dict[str, dict | torch.Tensor]:
+    def __getitem__(
+        self, idx
+    ) -> dict[
+        str, dict | torch.Tensor
+    ]:  # When horizons are non-contiguous it would be possible to make a separate horizon ts in the constructor which could be sliced through normally
         s_idx, end = self.index[idx]
         ts = self.series_list[s_idx]
         past_slice = slice(end - self.L, end)
-        future_slice = slice(end, end + self.H)
+        if self.is_contiguous:
+            future_slice = slice(end, end + self.H)
+        else:
+            future_slice = self.horizons + end - 1
 
         past_target = torch.tensor(ts.values[past_slice], dtype=torch.float32)
-        future_target = torch.tensor(ts.values[future_slice].flatten(), dtype=torch.float32)
+        future_target = torch.tensor(ts.values[self.horizons].flatten(), dtype=torch.float32)
 
         def get_covariate_tensor(covariates, slc, shift):
             if covariates is None:
                 return None
-            aligned = slice(slc.start + shift, slc.stop + shift)
-            vals = covariates[aligned].values
+            if isinstance(slc, slice):
+                aligned = slice(slc.start + shift, slc.stop + shift)
+            else:
+                aligned = slc + shift
+            vals = covariates.values[aligned]
             return torch.tensor(vals, dtype=torch.float32).unsqueeze(-1)
 
         past_shift = self.shifts[s_idx][0]
@@ -182,13 +204,15 @@ class TimeSeriesDataset(Dataset):
         past_covariates = get_covariate_tensor(self.past_covariates, past_slice, past_shift)
         historic_future_covariates = get_covariate_tensor(self.future_covariates, past_slice, past_shift)
         future_covariates = get_covariate_tensor(self.future_covariates, future_slice, future_shift)
-
+        static_covariates = (
+            torch.tensor(list(ts.static_covariates.values()), dtype=torch.float).unsqueeze(0).repeat(self.L, 1)
+        )
         out = {
             'past_target': past_target,
             'past_covariates': past_covariates,
             'historic_future_covariates': historic_future_covariates,
             'future_covariates': future_covariates,
-            'static_covariates': ts.static_covariates,
+            'static_covariates': static_covariates,
             'future_target': future_target,
         }
         return out
