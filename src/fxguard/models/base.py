@@ -30,6 +30,7 @@ def collate_dict(batch: list[dict]):
             out[k] = vals[0]  # weird I need to do this
     return out
 
+
 class BaseLightning(L.LightningModule, ABC):
     def __init__(
         self,
@@ -155,17 +156,45 @@ class BaseLightning(L.LightningModule, ABC):
             dataloaders=self.predict_dataloader(predict_dataset, dataloader_kwargs),  # need to remove dataloader
         )  # the shape here will have length equal to num input series
 
-    def historical_forecast(self, series, past_covariates=None, future_covariates=None, stride: int = 1):
-        predictions = []
-        dataset = TimeSeriesDataset(
-            series,
-            input_length=self.input_length,
-            h=self.h,
-            past_covariates=past_covariates,
-            future_covariates=future_covariates,
-            stride=stride,
+    def historical_forecast(
+        self,
+        series: TimeSeries | list[TimeSeries],
+        past_covariates: TimeSeries | list[TimeSeries] | None = None,
+        future_covariates: TimeSeries | list[TimeSeries] | None = None,
+        stride: int = 1,
+    ):
+        # Always treat series as a list
+        series_list = series if isinstance(series, list) else [series]
+        past_cov_list = (
+            past_covariates if isinstance(past_covariates, list) or past_covariates is None else [past_covariates]
         )
-        dataloader = DataLoader(dataset, batch_size=32, shuffle=False, collate_fn=collate_dict)
-        for batch in dataloader:
-            predictions.extend(self(batch).cpu().flatten().tolist())
-        return predictions
+        future_cov_list = (
+            future_covariates
+            if isinstance(future_covariates, list) or future_covariates is None
+            else [future_covariates]
+        )
+        all_predictions = []
+        for i, ts in enumerate(series_list):
+            pcov = past_cov_list[i] if past_cov_list and len(past_cov_list) > 1 else past_covariates
+            fcov = future_cov_list[i] if future_cov_list and len(future_cov_list) > 1 else future_covariates
+            dataset = TimeSeriesDataset(
+                ts,
+                input_length=self.input_length,
+                h=self.h,
+                past_covariates=pcov,
+                future_covariates=fcov,
+                stride=stride,
+            )
+            dataloader = DataLoader(dataset, batch_size=self.hparams.batch_size, shuffle=False, collate_fn=collate_dict)
+            predictions = []
+            for batch in dataloader:
+                predictions.extend(self(batch).cpu().flatten().tolist())
+            all_predictions.append(
+                TimeSeries(
+                    times=ts.time_index[self.hparams.input_length : len(ts.time_index) - self.H + 1],
+                    values=predictions,
+                    static_covariates=ts.static_covariates,
+                    components=ts.columns,
+                )
+            )
+        return all_predictions if len(all_predictions) > 1 else all_predictions[0]

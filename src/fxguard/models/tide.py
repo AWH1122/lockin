@@ -127,9 +127,7 @@ class TiDELite(BaseLightning):
         y_hist: torch.Tensor = batch['past_target']  # [B,L,1]
         Xp = batch['past_covariates']  # [B,L,Dp] (maybe empty)
         Xfhist = batch['historic_future_covariates']  # [B,L,Df] (maybe empty)
-        Xf = batch['future_covariates'] or torch.empty(
-            batch['future_target'].shape[0], self.H, 0
-        )  # [B,H,Df] (maybe empty)
+        Xf = batch['future_covariates'] # [B,H,Df] (maybe empty)
 
         parts = [y_hist]
         if Xp is not None:
@@ -138,14 +136,17 @@ class TiDELite(BaseLightning):
             parts.append(Xfhist)
         enc_input = torch.cat(parts, dim=2)  # [B,L, Dy+Dp+Df]
         flat_hist = enc_input.flatten(start_dim=1)  # [B, L*(...)]
-        flat_futr = Xf.flatten(start_dim=1)  # [B, H*Df]
-        enc = torch.cat([flat_hist, flat_futr], dim=1)  # [B, enc_inp_dim]
+        if Xf is not None:
+            flat_futr = Xf.flatten(start_dim=1)  # [B, H*Df]
+            enc = torch.cat([flat_hist, flat_futr], dim=1)  # [B, enc_inp_dim]
+        else:
+            enc = flat_hist
 
         z = self.encoders(enc)  # [B, hidden]
         dec = self.decoders(z)  # [B, H*D'*1]
         dec = dec.view(z.size(0), self.H, -1)  # [B,H,D']
         last_futr = Xf  # [B,H,Df]
-        if last_futr.size(-1):
+        if last_futr is not None and last_futr.size(-1):
             temp_in = torch.cat([dec, last_futr], dim=2)  # [B,H,D'+Df]
         else:
             temp_in = dec
